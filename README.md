@@ -1,4 +1,4 @@
-# megadl 🔽
+# Megadl 🔽
 
 A simple, no-nonsense CLI tool to download public files from MEGA.nz — no browser, no ads, no BS.
 
@@ -19,7 +19,7 @@ A simple, no-nonsense CLI tool to download public files from MEGA.nz — no brow
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/megadl.git
+git clone https://github.com/rajchaudhary-dev/mega-downloader.git
 cd megadl
 
 # Install dependencies
