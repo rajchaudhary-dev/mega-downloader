@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-megadl.py v1.2 — CLI tool to download public files and folders from MEGA.nz
+megadl.py v2.0 — CLI tool to download public files and folders from MEGA.nz
 
 Usage:
-  python megadl.py <mega_link> [options]
+  python megadl.py <mega_link|links.txt> [options]
 
 Options:
   --output <folder>    Folder to save the file(s) (default: current directory)
@@ -20,13 +20,15 @@ import struct
 import base64
 import os
 import argparse
+import time
 import requests
 from Crypto.Cipher import AES
 from Crypto.Util import Counter
 from tqdm import tqdm
 
 
-VERSION = "1.2.0"
+VERSION = "2.0.0"
+MAX_RETRIES = 2
 
 # ─────────────────────────────────────────────
 # MEGA API error codes
@@ -110,14 +112,29 @@ def parse_mega_link(url: str):
 
 
 # ─────────────────────────────────────────────
+# Queue loader
+# ─────────────────────────────────────────────
+
+def load_queue(filepath: str) -> list:
+    """
+    Reads a .txt file and returns a list of (line_number, url) tuples.
+    Skips blank lines and lines starting with #.
+    """
+    links = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f, 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            links.append((i, line))
+    return links
+
+
+# ─────────────────────────────────────────────
 # Key derivation
 # ─────────────────────────────────────────────
 
 def derive_key_and_iv(key_str: str):
-    """
-    XOR-folds the 256-bit URL key into a 128-bit AES key + 128-bit CTR IV.
-    Returns (aes_key, iv)
-    """
     raw = base64url_decode(key_str)
     if len(raw) != 32:
         raise ValueError(
@@ -126,20 +143,17 @@ def derive_key_and_iv(key_str: str):
         )
 
     k = struct.unpack(">8I", raw)
-
     aes_key = struct.pack(">4I",
         k[0] ^ k[4],
         k[1] ^ k[5],
         k[2] ^ k[6],
         k[3] ^ k[7],
     )
-
     iv = struct.pack(">4I", k[4], k[5], 0, 0)
     return aes_key, iv
 
 
 def derive_folder_key(key_str: str) -> bytes:
-    """Folder master key is simply base64url-decoded (16 bytes)."""
     raw = base64url_decode(key_str)
     if len(raw) != 16:
         raise ValueError(f"Invalid folder key length ({len(raw)} bytes).")
@@ -147,10 +161,6 @@ def derive_folder_key(key_str: str) -> bytes:
 
 
 def decrypt_node_key(encrypted_key_b64: str, folder_master_key: bytes) -> bytes:
-    """
-    Each file inside a folder has its own key encrypted with the folder master key.
-    Decrypt it using AES-128-ECB.
-    """
     raw = base64url_decode(encrypted_key_b64)
     cipher = AES.new(folder_master_key, AES.MODE_ECB)
     return cipher.decrypt(raw)
@@ -208,7 +218,6 @@ def get_file_info(file_id: str) -> dict:
 
 
 def get_folder_nodes(folder_id: str) -> list:
-    """Fetches all nodes (files + subfolders) inside a public folder."""
     data = api_request([{"a": "f", "c": 1, "r": 1}], params={"n": folder_id})
     result = data[0] if isinstance(data, list) else data
     if isinstance(result, int):
@@ -218,7 +227,6 @@ def get_folder_nodes(folder_id: str) -> list:
 
 
 def get_folder_file_url(node_id: str, folder_id: str) -> dict:
-    """Gets the download URL for a specific file node inside a folder."""
     data = api_request([{"a": "g", "g": 1, "n": node_id}], params={"n": folder_id})
     result = data[0] if isinstance(data, list) else data
     if isinstance(result, int):
@@ -293,7 +301,7 @@ def download_and_decrypt(
         )
 
     cipher = make_ctr_cipher(aes_key, iv, offset_bytes=existing_bytes)
-    chunk_size = 1024 * 128  # 128 KB
+    chunk_size = 1024 * 128
 
     mode = "ab" if existing_bytes > 0 else "wb"
 
@@ -314,41 +322,55 @@ def download_and_decrypt(
 
 
 # ─────────────────────────────────────────────
+# Auto-retry wrapper
+# ─────────────────────────────────────────────
+
+def with_retry(fn, *args, label="", **kwargs):
+    """
+    Calls fn(*args, **kwargs) up to MAX_RETRIES+1 times.
+    On failure waits 3s before retrying. Returns True on success, False on all failures.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            fn(*args, **kwargs)
+            return True
+        except RuntimeError as e:
+            if attempt < MAX_RETRIES:
+                print(f"  ⚠️   Failed (attempt {attempt + 1}/{MAX_RETRIES + 1}): {e}")
+                print(f"  🔄  Retrying in 3s...")
+                time.sleep(3)
+            else:
+                print(f"  ❌  Failed after {MAX_RETRIES + 1} attempts: {e}")
+    return False
+
+
+# ─────────────────────────────────────────────
 # Build folder tree from flat node list
 # ─────────────────────────────────────────────
 
 def build_folder_tree(nodes: list, folder_master_key: bytes):
-    """
-    Takes the raw flat node list from the MEGA API and returns:
-      - node_map: dict of node_id -> node info (with decrypted name + key)
-      - root_id:  the top-level folder node id
-    """
     node_map = {}
-    all_ids = {n.get("h") for n in nodes}
-    root_id = None
+    all_ids  = {n.get("h") for n in nodes}
+    root_id  = None
 
     for node in nodes:
-        ntype    = node.get("t")
-        node_id  = node.get("h")
+        ntype     = node.get("t")
+        node_id   = node.get("h")
         parent_id = node.get("p")
-        at_b64   = node.get("a", "")
-        key_b64  = node.get("k", "")
+        at_b64    = node.get("a", "")
+        key_b64   = node.get("k", "")
 
-        # Key field can be "userhandle:keydata" — take the key part only
         if ":" in key_b64:
             key_b64 = key_b64.split(":")[-1]
 
-        name     = node_id  # fallback
+        name     = node_id
         node_key = None
 
         if key_b64 and folder_master_key:
             try:
-                raw_key = decrypt_node_key(key_b64, folder_master_key)
+                raw_key  = decrypt_node_key(key_b64, folder_master_key)
                 node_key = raw_key
 
-                # File nodes have a 32-byte key that must be XOR-folded to get
-                # the real 16-byte AES key (same as derive_key_and_iv does).
-                # Folder nodes have a 16-byte key used as-is.
                 if len(raw_key) == 32:
                     k = struct.unpack(">8I", raw_key)
                     attr_key = struct.pack(">4I",
@@ -362,18 +384,17 @@ def build_folder_tree(nodes: list, folder_master_key: bytes):
 
                 if at_b64:
                     attrs = decrypt_attributes(at_b64, attr_key)
-                    name = attrs.get("n", node_id)
+                    name  = attrs.get("n", node_id)
             except Exception:
                 pass
 
-        # Root = a folder node whose parent is not in this node set
         if ntype == 1 and parent_id not in all_ids:
             root_id = node_id
 
         node_map[node_id] = {
             "id":     node_id,
             "parent": parent_id,
-            "type":   ntype,   # 0=file, 1=folder
+            "type":   ntype,
             "name":   name,
             "key":    node_key,
             "size":   node.get("s", 0),
@@ -383,17 +404,13 @@ def build_folder_tree(nodes: list, folder_master_key: bytes):
 
 
 def collect_files(node_map: dict, root_id: str):
-    """
-    Walks the folder tree and yields (relative_path, node)
-    for every file node, preserving subfolder structure.
-    """
     def walk(node_id, path_parts):
         node = node_map.get(node_id)
         if not node:
             return
-        if node["type"] == 0:  # file
-            yield os.path.join(*path_parts, node["name"]) if path_parts else node["name"], node
-        elif node["type"] == 1:  # folder
+        if node["type"] == 0:
+            yield (os.path.join(*path_parts, node["name"]) if path_parts else node["name"]), node
+        elif node["type"] == 1:
             sub = path_parts + [node["name"]]
             for child in node_map.values():
                 if child["parent"] == node_id:
@@ -408,12 +425,14 @@ def collect_files(node_map: dict, root_id: str):
 # Single file download flow
 # ─────────────────────────────────────────────
 
-def handle_file(args, link_id: str, key_str: str):
+def handle_file(args, link_id: str, key_str: str, is_queue: bool = False):
     print("\n🌐  Fetching file info from MEGA API...")
     try:
         info = get_file_info(link_id)
     except RuntimeError as e:
         print(f"\n❌  {e}")
+        if is_queue:
+            return False
         sys.exit(1)
 
     download_url = info.get("g")
@@ -427,23 +446,27 @@ def handle_file(args, link_id: str, key_str: str):
             "    • The link may have expired\n"
             "    • MEGA may be rate-limiting your IP (try again in a few minutes)"
         )
+        if is_queue:
+            return False
         sys.exit(1)
 
     try:
         aes_key, iv = derive_key_and_iv(key_str)
     except ValueError as e:
         print(f"\n❌  Key error: {e}")
+        if is_queue:
+            return False
         sys.exit(1)
 
     filename = link_id
     if at_b64:
         try:
-            attrs = decrypt_attributes(at_b64, aes_key)
+            attrs    = decrypt_attributes(at_b64, aes_key)
             filename = attrs.get("n", link_id)
         except Exception:
             print("⚠️   Could not decrypt filename — using file ID as filename.")
 
-    if args.output_name:
+    if hasattr(args, "output_name") and args.output_name and not is_queue:
         filename = args.output_name
 
     output_dir = os.path.expanduser(args.output)
@@ -451,45 +474,44 @@ def handle_file(args, link_id: str, key_str: str):
     filepath = os.path.join(output_dir, filename)
 
     print(f"\n{'─'*50}")
-    try:
-        download_and_decrypt(
-            download_url=download_url,
-            aes_key=aes_key,
-            iv=iv,
-            filepath=filepath,
-            file_size=file_size,
-            resume=not args.no_resume,
-        )
-    except RuntimeError as e:
-        print(f"\n❌  {e}")
-        sys.exit(1)
+    success = with_retry(
+        download_and_decrypt,
+        download_url, aes_key, iv, filepath, file_size,
+        not args.no_resume,
+        label=filename,
+    )
 
-    print(f"\n✅  Done → {os.path.abspath(filepath)}")
+    if success:
+        print(f"\n✅  Done → {os.path.abspath(filepath)}")
+    return success
 
 
 # ─────────────────────────────────────────────
 # Folder download flow
 # ─────────────────────────────────────────────
 
-def handle_folder(args, folder_id: str, key_str: str):
-    if args.output_name:
+def handle_folder(args, folder_id: str, key_str: str, is_queue: bool = False):
+    if hasattr(args, "output_name") and args.output_name and not is_queue:
         print("⚠️   --output-name is ignored for folder downloads.")
 
     print("\n🌐  Fetching folder contents from MEGA API...")
     try:
         folder_master_key = derive_folder_key(key_str)
-        nodes = get_folder_nodes(folder_id)
+        nodes             = get_folder_nodes(folder_id)
     except RuntimeError as e:
         print(f"\n❌  {e}")
+        if is_queue:
+            return False
         sys.exit(1)
 
     if not nodes:
         print("❌  No files found in this folder. It may be empty or the link is invalid.")
+        if is_queue:
+            return False
         sys.exit(1)
 
     node_map, root_id = build_folder_tree(nodes, folder_master_key)
 
-    # Fallback root detection
     if not root_id:
         for n in node_map.values():
             if n["type"] == 1:
@@ -500,6 +522,8 @@ def handle_folder(args, folder_id: str, key_str: str):
 
     if not files:
         print("❌  No downloadable files found in this folder.")
+        if is_queue:
+            return False
         sys.exit(1)
 
     root_name  = node_map.get(root_id, {}).get("name", folder_id)
@@ -551,24 +575,20 @@ def handle_folder(args, folder_id: str, key_str: str):
             continue
 
         try:
-            download_and_decrypt(
-                download_url=download_url,
-                aes_key=aes_key,
-                iv=iv,
-                filepath=filepath,
-                file_size=node["size"],
-                resume=not args.no_resume,
+            success = with_retry(
+                download_and_decrypt,
+                download_url, aes_key, iv, filepath, node["size"],
+                not args.no_resume,
+                label=node["name"],
             )
-        except RuntimeError as e:
-            print(f"  ❌  {e}")
-            failed.append(rel_path)
+            if not success:
+                failed.append(rel_path)
         except KeyboardInterrupt:
             print("\n\n⚠️   Interrupted. Run the same command to resume.")
             sys.exit(0)
 
         print()
 
-    # Summary
     succeeded = len(files) - len(failed)
     print(f"{'─'*50}")
     print(f"✅  {succeeded}/{len(files)} files downloaded → {os.path.abspath(base_dir)}")
@@ -576,6 +596,75 @@ def handle_folder(args, folder_id: str, key_str: str):
         print(f"❌  {len(failed)} file(s) failed:")
         for f in failed:
             print(f"     • {f}")
+
+    return len(failed) == 0
+
+
+# ─────────────────────────────────────────────
+# Queue download flow
+# ─────────────────────────────────────────────
+
+def handle_queue(args, queue_file: str):
+    print(f"\n📋  Loading queue from: {queue_file}")
+
+    try:
+        links = load_queue(queue_file)
+    except FileNotFoundError:
+        print(f"❌  File not found: {queue_file}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌  Could not read queue file: {e}")
+        sys.exit(1)
+
+    if not links:
+        print("❌  No links found in the file. Add one MEGA link per line.")
+        sys.exit(1)
+
+    print(f"🔗  Found {len(links)} link(s)\n")
+
+    succeeded = []
+    failed    = []
+
+    for idx, (line_num, url) in enumerate(links, 1):
+        print(f"\n{'═'*50}")
+        print(f"⬇️   [{idx}/{len(links)}]  {url[:60]}{'...' if len(url) > 60 else ''}")
+        print(f"{'═'*50}")
+
+        try:
+            link_type, link_id, key_str = parse_mega_link(url)
+        except ValueError as e:
+            print(f"❌  Invalid link (line {line_num}): {e}")
+            failed.append((line_num, url, "Invalid link"))
+            continue
+
+        try:
+            if link_type == "file":
+                ok = handle_file(args, link_id, key_str, is_queue=True)
+            else:
+                ok = handle_folder(args, link_id, key_str, is_queue=True)
+
+            if ok:
+                succeeded.append((line_num, url))
+            else:
+                failed.append((line_num, url, "Download failed"))
+
+        except KeyboardInterrupt:
+            print("\n\n⚠️   Queue interrupted.")
+            print(f"     Completed {len(succeeded)}/{len(links)} before stopping.")
+            sys.exit(0)
+
+    # ── Queue summary ──
+    print(f"\n{'═'*50}")
+    print(f"📊  Queue complete: {len(succeeded)}/{len(links)} succeeded")
+
+    if failed:
+        print(f"\n❌  Failed ({len(failed)}):")
+        for line_num, url, reason in failed:
+            short_url = url[:55] + "..." if len(url) > 55 else url
+            print(f"     • Line {line_num}: {short_url}")
+            print(f"              Reason: {reason}")
+
+    print(f"{'═'*50}\n")
 
 
 # ─────────────────────────────────────────────
@@ -591,12 +680,15 @@ def build_parser():
             "Examples:\n"
             "  python megadl.py 'https://mega.nz/file/ABC123#key'\n"
             "  python megadl.py 'https://mega.nz/folder/ABC123#key'\n"
-            "  python megadl.py 'https://mega.nz/file/ABC123#key' --output ~/Downloads\n"
-            "  python megadl.py 'https://mega.nz/file/ABC123#key' --output-name myvideo.mp4\n"
-            "  python megadl.py 'https://mega.nz/file/ABC123#key' --no-resume\n"
+            "  python megadl.py links.txt\n"
+            "  python megadl.py links.txt -o ~/Downloads\n"
+            "  python megadl.py 'https://mega.nz/file/ABC123#key' -o ~/Downloads -n video.mp4\n"
         )
     )
-    parser.add_argument("link", help="Public MEGA.nz file or folder link")
+    parser.add_argument(
+        "input",
+        help="A MEGA link or a .txt file containing one MEGA link per line"
+    )
     parser.add_argument(
         "--output", "-o",
         metavar="FOLDER",
@@ -607,7 +699,7 @@ def build_parser():
         "--output-name", "-n",
         metavar="NAME",
         default=None,
-        help="Rename the downloaded file (single file only)"
+        help="Rename the downloaded file (single file only, ignored for queue/folder)"
     )
     parser.add_argument(
         "--no-resume",
@@ -628,13 +720,21 @@ def build_parser():
 
 def main():
     parser = build_parser()
-    args = parser.parse_args()
+    args   = parser.parse_args()
 
     print(f"⚡  megadl v{VERSION}\n")
 
+    inp = args.input
+
+    # ── Detect if input is a .txt queue file ──
+    if inp.endswith(".txt") or (os.path.isfile(inp) and not inp.startswith("http")):
+        handle_queue(args, inp)
+        return
+
+    # ── Single link ──
     print("🔍  Parsing MEGA link...")
     try:
-        link_type, link_id, key_str = parse_mega_link(args.link)
+        link_type, link_id, key_str = parse_mega_link(inp)
     except ValueError as e:
         print(f"\n❌  Invalid link:\n    {e}")
         sys.exit(1)

@@ -7,8 +7,9 @@ A simple, no-nonsense CLI tool to download public files and folders from MEGA.nz
 - Works with both old and new MEGA link formats
 - Download single files **and entire folders**
 - Folder downloads preserve the original subfolder structure
+- **Bulk download queue** — pass a `.txt` file with one link per line
+- **Auto-retry** — failed downloads are retried twice automatically before skipping
 - **Resume interrupted downloads** — just run the same command again
-- Real-time progress bar
 - Lightweight — just Python + 3 small dependencies
 
 ## Requirements
@@ -31,6 +32,7 @@ pip install -r requirements.txt
 
 ```bash
 python megadl.py '<mega_link>' [options]
+python megadl.py '<txt_file>' [options]
 ```
 
 ### Options
@@ -38,7 +40,7 @@ python megadl.py '<mega_link>' [options]
 | Flag | Short | Description |
 |---|---|---|
 | `--output <folder>` | `-o` | Folder to save the file(s) (default: current directory) |
-| `--output-name <name>` | `-n` | Rename the downloaded file (single file only) |
+| `--output-name <n>` | `-n` | Rename the downloaded file (single file only) |
 | `--no-resume` | | Force a fresh download, ignore partial files |
 | `--version` | `-v` | Show version |
 | `--help` | `-h` | Show help |
@@ -46,11 +48,17 @@ python megadl.py '<mega_link>' [options]
 ### Examples
 
 ```bash
-# Basic download
-python megadl.py '<mega_link>'
+# Download a single file
+python megadl.py '<mega_file_link>'
 
 # Download an entire folder
-python megadl.py '<mega_link>'
+python megadl.py '<mega_folder_link>'
+
+# Bulk download from a txt file
+python megadl.py links.txt
+
+# Bulk download to a specific folder
+python megadl.py links.txt -o ~/Downloads
 
 # Save to a specific folder
 python megadl.py '<mega_link>' -o ~/Downloads
@@ -60,32 +68,50 @@ python megadl.py '<mega_link>' -n myvideo.mp4
 
 # Save to folder AND rename
 python megadl.py '<mega_link>' -o ~/Downloads -n myvideo.mp4
-
-# Force fresh download
-python megadl.py '<mega_link>' --no-resume
 ```
 
-### Folder downloads
+### Bulk queue download
 
-When you pass a folder link, megadl fetches the full folder tree, recreates the subfolder structure on disk, and downloads every file:
+Create a `links.txt` file with one MEGA link per line. Blank lines and lines starting with `#` are ignored:
 
 ```
-📂  Folder   : My Project Files
-📄  Files    : 12
-📦  Total    : 847.30 MB
-💾  Saving to: /home/user/Downloads/My Project Files
+# My downloads
+https://mega.nz/file/ABC12345#key1
+https://mega.nz/folder/XYZ56789#key2
+https://mega.nz/file/DEF00000#key3
 
-[1/12]
-  📥  video.mp4  (512.00 MB)
-  video.mp4  100%|████████████████| 512M/512M
+```
 
-──────────────────────────────────────────────────
-✅  12/12 files downloaded → /home/user/Downloads/My Project Files
+Then run:
+
+```bash
+python megadl.py links.txt
+```
+
+megadl downloads each link one by one and prints a summary at the end:
+
+```
+══════════════════════════════════════════════════
+📊  Queue complete: 3/4 succeeded
+
+❌  Failed (1):
+     • Line 3: https://mega.nz/file/DEF00000#key3
+               Reason: Download failed
+══════════════════════════════════════════════════
+```
+
+### Auto-retry
+
+If a download fails (network blip, timeout, etc.), megadl automatically retries it twice before moving on. No flags needed — it just works silently.
+
+```
+  ⚠️   Failed (attempt 1/3): Lost connection.
+  🔄  Retrying in 3s...
 ```
 
 ### Resume downloads
 
-If a download is interrupted (Ctrl+C, lost connection, etc.), just run the exact same command again — megadl will detect the partial file and pick up where it left off.
+If a download is interrupted (Ctrl+C, lost connection, etc.), just run the exact same command again — megadl will detect the partial file and pick up where it left off. Works for single files, folders, and queues.
 
 ```
 ⏩  Partial file found — resuming from 512.00 MB of 2048.00 MB
@@ -133,6 +159,7 @@ The 256-bit key in the URL is XOR-folded into a 128-bit AES key and a 64-bit non
 | `API error -4` or `-19` | Rate limited — wait a minute and try again |
 | No download URL returned | The link expired or MEGA is rate-limiting your IP — try again |
 | Files downloaded with random names | Make sure you copied the full folder link including the key after `#` |
+| Queue file not found | Make sure the path to your `.txt` file is correct |
 
 ## Disclaimer
 
